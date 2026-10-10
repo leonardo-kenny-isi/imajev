@@ -21,6 +21,9 @@ with a probability on each and an explicit <i>can't tell</i>. Your system acts w
   <a href="https://huggingface.co/spaces/Hanno-Labs/decision-bench-leaderboard"><img alt="DecisionBench: #3 of 56 models" src="https://img.shields.io/badge/DecisionBench-%233%20of%2056%20models-111111?style=for-the-badge"></a>
 </p>
 
+<p align="center">Built by <b>Mohit Garg</b>. I build decision systems like this for operations, support and back-office teams:<br>
+refunds, returns, ticket routing, document and photo checks. <a href="https://mohitgarg.ai"><b>Work with me → mohitgarg.ai</b></a></p>
+
 <p align="center"><a href="https://huggingface.co/spaces/mohit67890/imajev"><img alt="Try the live demo on Hugging Face Spaces" src="https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-lg.svg"></a></p>
 
 <p align="center"><a href="https://huggingface.co/spaces/mohit67890/imajev"><b>Live demo</b></a> · <a href="https://mohit67890.github.io/imajev/"><b>Website</b></a> · <a href="#quickstart">Quickstart</a> · <a href="#checked-not-cherry-picked">Checked examples</a> · <a href="#results">Results</a> · <a href="https://mohit67890.github.io/imajev/report/">Technical report</a></p>
