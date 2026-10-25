@@ -193,20 +193,24 @@ class TorchDecision:
  def _base(self):
   """The Qwen3.5 model under a PEFT wrapper (its LoRA layers stay in place) or the merged model itself."""
   return self.model.get_base_model() if hasattr(self.model,'get_base_model') else self.model
- def _embeds_positions(self,inputs):
+ def _embeds_positions(self,inputs,memo=None):
   """The multimodal model's forward up to the language model: token embeddings with the image features scattered in, and the
   M-RoPE position ids (3 x 1 x n). Text-only positions are 0..n-1 on every axis, as the model's own default."""
   m=self._base().model;ids=inputs['input_ids'];embeds=m.get_input_embeddings()(ids)
   if 'pixel_values' not in inputs:return embeds,torch.arange(ids.shape[1],device=ids.device).view(1,1,-1).expand(3,1,-1)
-  features=torch.cat(m.get_image_features(inputs['pixel_values'],inputs['image_grid_thw'],return_dict=True).pooler_output,dim=0).to(embeds.device,embeds.dtype)
+  key=(tuple(inputs['pixel_values'].shape),tuple(inputs['image_grid_thw'].flatten().tolist()))
+  features=None if memo is None else memo.get(key)  # memo: one request's presentation orders, same images (same pixels, same encoding)
+  if features is None or not torch.equal(memo['pixels'],inputs['pixel_values']):
+   features=torch.cat(m.get_image_features(inputs['pixel_values'],inputs['image_grid_thw'],return_dict=True).pooler_output,dim=0).to(embeds.device,embeds.dtype)
+   if memo is not None:memo.clear();memo[key]=features;memo['pixels']=inputs['pixel_values']
   mask,_=m.get_placeholder_mask(ids,inputs_embeds=embeds,image_features=features);embeds=embeds.masked_scatter(mask,features)
   positions=m.compute_3d_position_ids(input_ids=ids,inputs_embeds=embeds,image_grid_thw=inputs['image_grid_thw'],attention_mask=inputs.get('attention_mask'),mm_token_type_ids=inputs.get('mm_token_type_ids'))
   return embeds,positions
- def candidate_logits_fast(self,inputs,token_ids):
+ def candidate_logits_fast(self,inputs,token_ids,memo=None):
   """candidate_logits(), through a recorded CUDA graph when one fits the prompt length."""
   inputs={k:v.to(self.device) for k,v in inputs.items()};base=self._base()
   if inputs.get('pixel_values') is not None and inputs['pixel_values'].dtype==torch.uint8:inputs['pixel_values']=self.normalize_patches(inputs['pixel_values'])
-  embeds,positions=self._embeds_positions(inputs);graphs=self.__dict__.get('graphs')
+  embeds,positions=self._embeds_positions(inputs,memo);graphs=self.__dict__.get('graphs')
   hidden=graphs.run(embeds,positions) if graphs is not None and graphs.fits(embeds.shape[1]) else base.model.language_model(inputs_embeds=embeds,position_ids=positions,use_cache=False).last_hidden_state[0,-1]
   indices=self._readout_indices(token_ids)
   return self.readout(hidden.float())[indices] if self.readout is not None and indices is not None else hidden.float()@base.lm_head.weight[torch.tensor(token_ids,device=self.device)].float().T

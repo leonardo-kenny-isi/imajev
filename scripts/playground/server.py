@@ -10,9 +10,11 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import hmac
 import json
 import logging
 import mimetypes
+import os
 import re
 import sys
 import threading
@@ -109,12 +111,14 @@ class TorchBackend:
     supports_thinking = True
 
     def __init__(self, bundle=BUNDLE, adapter=None, device=None, rotations=1, max_input_tokens=4096, readout_codes=None,
-                 prompt_layout=None, fast=False, graph_lengths=None, merge_lora=False, float32=False):
+                 prompt_layout=None, fast=False, graph_lengths=None, merge_lora=False, float32=False, batch=False, batch_rows=16):
         import torch
         from torch_decision import GRAPH_LENGTHS, TorchDecision
         self.torch = torch
         self.rotations = max(1, int(rotations))
         self.fast = bool(fast)
+        self.batch = bool(batch)  # requests waiting together, all their presentation orders in left-padded forwards (score_many)
+        self.batch_rows = max(1, int(batch_rows))
         if device is None:  # CUDA on a pod or Space, Metal on a Mac, CPU otherwise
             device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         self.bundle = json.loads(Path(bundle).read_text())
@@ -164,18 +168,20 @@ class TorchBackend:
         thought of at most max_tokens, and its decision is read again right after the thought (docs/think-if-unsure-plan.md)."""
         if thinking is not None and thinking.active and self.rotations != 1:
             raise PlaygroundError(422, "invalid_request", "thinking needs a server running --rotations 1")
+        if self.batch and not (thinking is not None and thinking.active):
+            return self.score_many([(images, request)])[0]
         results, seconds, tokens, thoughts = [], 0.0, 0, []
         for field in request.fields:
             header, choices, texts = compile_question(field, request.state, getattr(self, "prompt_layout", "standard"))
             labels = self.engine.labels(len(choices), len(images))
             start = perf_counter()
-            passes = []
+            passes, memo = [], {}  # memo: the image features, encoded once for every presentation order
             for offset in cyclic_offsets(len(choices), self.rotations):
                 prompt = header + "\n".join(f"{label}: {text}" for label, text in zip(labels, rotate(texts, offset)))
                 if getattr(self, "fast", False):
                     with self.torch.inference_mode():
                         _, inputs, token_ids = self.engine.prepare_fast(images, prompt, labels)
-                        logits = [float(x) for x in self.engine.candidate_logits_fast(inputs, token_ids).cpu().tolist()]
+                        logits = [float(x) for x in self.engine.candidate_logits_fast(inputs, token_ids, memo).cpu().tolist()]
                 else:
                     with self.torch.no_grad():
                         _, inputs, token_ids = self.engine.prepare(images, prompt, labels)
@@ -199,6 +205,40 @@ class TorchBackend:
         if thinking is not None and thinking.active:
             usage["thinking"] = {"mode": thinking.mode, "max_tokens": thinking.max_tokens, "thought": thoughts}
         return results, usage
+
+    def score_many(self, items):
+        """--batch: every presentation order of every question of every request in items ([(images, request)]) in left-padded
+        batches of at most batch_rows prompts, similar image sizes together (less padding). Left padding keeps every decision
+        position last; the gated DeltaNet layers see zeros before the prompt (their state stays zero) and full attention masks
+        them. Same rotation averaging as score(). Returns [(results, usage)] in the order of items."""
+        rows, plan = [], []
+        for n, (images, request) in enumerate(items):
+            for field in request.fields:
+                header, choices, texts = compile_question(field, request.state, getattr(self, "prompt_layout", "standard"))
+                labels = self.engine.labels(len(choices), len(images))
+                offsets = cyclic_offsets(len(choices), self.rotations)
+                plan.append((n, choices, offsets, len(rows)))
+                rows += [(images, header + "\n".join(f"{label}: {text}" for label, text in zip(labels, rotate(texts, offset))), labels) for offset in offsets]
+        order = sorted(range(len(rows)), key=lambda i: sum(im.width * im.height for im in rows[i][0]))
+        logits, tokens = [None] * len(rows), [0] * len(rows)
+        start = perf_counter()
+        with self.torch.inference_mode():
+            for k in range(0, len(order), self.batch_rows):
+                chunk = order[k:k + self.batch_rows]
+                inputs, ids, _ = self.engine.collate([(*self.engine.render_example(*rows[i]), None) for i in chunk])
+                for j, (i, row, token_ids) in enumerate(zip(chunk, self.engine.candidate_logits_batch(inputs, ids), ids)):
+                    logits[i] = ([float(x) for x in row.cpu().tolist()], token_ids)
+                    tokens[i] = int(inputs["attention_mask"][j].sum())
+        seconds = perf_counter() - start
+        out = [([], {"prefill_ms": 0.0, "questions_ms": round(seconds * 1000, 1), "input_tokens": 0, "rotations": self.rotations,
+                     "batch_rows": len(rows)}) for _ in items]
+        for n, choices, offsets, first in plan:
+            passes = [(offset, *logits[first + j]) for j, offset in enumerate(offsets)]
+            result = (result_from_logits(choices, passes[0][1], token_ids=passes[0][2]) if len(passes) == 1
+                      else combine_rotations(choices, [(offset, values) for offset, values, _ in passes]))
+            out[n][0].append(result)
+            out[n][1]["input_tokens"] = max(out[n][1]["input_tokens"], *tokens[first:first + len(offsets)])
+        return out
 
     def _think(self, images, prompt, choices, labels, thinking):
         """-> (the Result read after a greedy thought, a usage note). `prompt` is the rotations == 1 single-pass prompt."""
@@ -224,7 +264,7 @@ def _warn_layout(trained, served):
 
 
 def build_backend(kind, adapter=None, no_adapter=False, bundle=BUNDLE, rotations=1, max_input_tokens=4096,
-                  readout_codes=None, prompt_layout=None, fast=False, merge_lora=False, float32=False):
+                  readout_codes=None, prompt_layout=None, fast=False, merge_lora=False, float32=False, batch=False, batch_rows=16):
     """`auto` prefers MLX with the converted adapter and falls back to torch + the PEFT adapter.
 
     readout_codes None / prompt_layout None follow the adapter (its readout rows; its decision_readout.json layout)."""
@@ -247,7 +287,7 @@ def build_backend(kind, adapter=None, no_adapter=False, bundle=BUNDLE, rotations
     if kind == "torch":
         return TorchBackend(bundle, chosen, rotations=rotations, max_input_tokens=max_input_tokens,
                             readout_codes=readout_codes, prompt_layout=prompt_layout, fast=fast, merge_lora=merge_lora,
-                            float32=float32)
+                            float32=float32, batch=batch, batch_rows=batch_rows)
     raise ValueError(f"Unknown backend {kind!r}")
 
 
@@ -372,7 +412,7 @@ def compile_payload(payload, max_options=MAX_OPTIONS):
 
 # ------------------------------------------------------------------------------------------- app
 
-def create_app(backend, examples=None, static=STATIC, calibration=None, thinking=None):
+def create_app(backend, examples=None, static=STATIC, calibration=None, thinking=None, api_key=None):
     """`backend` needs .name, .model, .adapter, .load_seconds and .score(images, request); a backend with
     .supports_thinking also takes .score(images, request, thinking=ThinkingPolicy). `thinking` = the server's default policy
     (off unless the server was started with --thinking); a request's "thinking" object overrides it."""
@@ -381,6 +421,43 @@ def create_app(backend, examples=None, static=STATIC, calibration=None, thinking
     app.state.backend = backend
     app.state.examples = load_examples() if examples is None else examples
     app.state.lock = threading.Lock()
+    batching = getattr(backend, "batch", False)
+
+    if api_key:  # every request, /v1/models included, needs "Authorization: Bearer <key>"
+        expected = f"Bearer {api_key}".encode()
+
+        @app.middleware("http")
+        async def require_key(request, call_next):
+            if not hmac.compare_digest((request.headers.get("authorization") or "").encode(), expected):
+                return JSONResponse({"error": "unauthorized", "detail": "missing or wrong bearer token"}, status_code=401)
+            return await call_next(request)
+
+    if batching:
+        import queue
+        from concurrent.futures import Future
+        waiting = queue.Queue()
+
+        def worker():
+            """One thread owns the GPU: it takes every request waiting (up to batch_rows prompts) and scores them together;
+            when a batch fails, each of its requests is scored alone so only the bad one fails."""
+            per = max(1, backend.batch_rows // max(1, backend.rotations))
+            while True:
+                items = [waiting.get()]
+                while len(items) < per:
+                    try:
+                        items.append(waiting.get_nowait())
+                    except queue.Empty:
+                        break
+                try:
+                    for (_, _, done), out in zip(items, backend.score_many([(im, rq) for im, rq, _ in items])):
+                        done.set_result(out)
+                except Exception:
+                    for im, rq, done in items:
+                        try:
+                            done.set_result(backend.score_many([(im, rq)])[0])
+                        except Exception as exc:
+                            done.set_exception(exc)
+        threading.Thread(target=worker, daemon=True).start()
 
     @app.exception_handler(PlaygroundError)
     async def playground_error(request, exc):
@@ -433,6 +510,10 @@ def create_app(backend, examples=None, static=STATIC, calibration=None, thinking
             raise PlaygroundError(422, "invalid_request", f"thinking is not available on the {backend.name} backend")
 
         def run():
+            if batching and not policy.active:
+                done = Future()
+                waiting.put((images, request, done))
+                return done.result()
             with app.state.lock:  # one GPU: strictly sequential
                 return backend.score(images, request, thinking=policy) if policy.active else backend.score(images, request)
 
@@ -487,6 +568,10 @@ def main(argv=None):
     parser.add_argument("--fast", action="store_true",
                         help="torch only: tokenize once and, on CUDA, replay recorded graphs of the language model "
                              "(captured at load, about a minute); same decisions as without it")
+    parser.add_argument("--batch", action="store_true",
+                        help="torch only: the requests waiting together, every presentation order of their questions, in "
+                             "left-padded batches (the training collate path)")
+    parser.add_argument("--batch-rows", type=int, default=16, help="--batch: prompts per forward at most")
     parser.add_argument("--merge-lora", action="store_true",
                         help="torch only: fold the LoRA into the weights at load (a little faster; bf16 rounding can move "
                              "near-tie decisions)")
@@ -507,12 +592,14 @@ def main(argv=None):
                         help="torch only: serve in float32 on CUDA too (a slow reference for checking bf16 serving paths)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--api-key", default=os.environ.get("JUDGE_API_KEY") or None,
+                        help="require this bearer token on every request (default: $JUDGE_API_KEY; unset = no check)")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
     backend = build_backend(args.backend, args.adapter, args.no_adapter, Path(args.model_bundle), args.rotations,
                             args.max_input_tokens, readout_codes=args.readout_codes,
                             prompt_layout=None if args.prompt_layout == "auto" else args.prompt_layout, fast=args.fast,
-                            merge_lora=args.merge_lora, float32=args.float32)
+                            merge_lora=args.merge_lora, float32=args.float32, batch=args.batch, batch_rows=args.batch_rows)
     if args.model_name:
         backend.model = args.model_name
     log.info("backend=%s model=%s adapter=%s load_seconds=%.1f readout_codes=%s prompt_layout=%s",
@@ -531,7 +618,7 @@ def main(argv=None):
             parser.error("--think-engine vllm needs the torch backend")
         from thought_engine import VLLMThoughts
         backend.thoughts = VLLMThoughts(args.think_url, args.think_model, backend.engine.processor.tokenizer)
-    uvicorn.run(create_app(backend, calibration=calibration, thinking=thinking), host=args.host, port=args.port, log_level="warning")
+    uvicorn.run(create_app(backend, calibration=calibration, thinking=thinking, api_key=args.api_key), host=args.host, port=args.port, log_level="warning")
     return 0
 
 
